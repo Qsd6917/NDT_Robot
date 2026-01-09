@@ -21,7 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "encoder.h"
+#include "pid_controller.h"
+#include "motor_control.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,7 +42,9 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim2;  // 编码器定时器
+TIM_HandleTypeDef htim3;  // PWM定时器
+TIM_HandleTypeDef htim6;  // PID计算定时器
 
 UART_HandleTypeDef huart1;
 
@@ -51,12 +55,24 @@ int pkt_idx = 0;
 int pkt_recv = 0;
 uint32_t last_valid_ms = 0;
 uint8_t current_speed_val = 128;
+
+// 电机控制对象
+Motor_Control_TypeDef motor1;
+
+// PID计算定时器标志
+volatile uint8_t pid_update_flag = 0;
+
+// 调试输出控制（可通过条件编译启用）
+#define DEBUG_ENABLE 0  // 设置为1启用调试输出
+uint32_t debug_counter = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_TIM2_Init(void);  // 编码器定时器
 static void MX_TIM3_Init(void);
+static void MX_TIM6_Init(void);  // PID计算定时器
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static inline uint16_t map_speed(uint8_t s) { return (uint16_t)((uint32_t)s * 999u / 255u); }
@@ -94,7 +110,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
           if (ok) {
             uint8_t spd = pkt_buf[1];
             uint8_t lift = pkt_buf[9];
-            update_speed(spd);
+            
+            // 使用新的电机控制模块
+            float target_speed = Motor_Control_MapRemoteSpeed(spd);
+            Motor_Control_SetTargetSpeed(&motor1, target_speed);
+            
             HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, lift ? GPIO_PIN_SET : GPIO_PIN_RESET);
             last_valid_ms = HAL_GetTick();
           }
@@ -107,6 +127,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
       }
     }
     HAL_UART_Receive_IT(&huart1, (uint8_t*)&uart_rx, 1);
+  }
+}
+
+// TIM6中断回调（PID计算）
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6)
+  {
+    pid_update_flag = 1;  // 设置标志，在主循环中处理
   }
 }
 /* USER CODE END 0 */
@@ -140,11 +169,23 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_TIM3_Init();
+  MX_TIM2_Init();   // 编码器定时器
+  MX_TIM3_Init();   // PWM定时器
+  MX_TIM6_Init();   // PID计算定时器
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  update_speed(128);
+  
+  // 配置中断优先级（数值越小优先级越高）
+  // 编码器定时器（TIM2）不需要中断，硬件自动计数
+  HAL_NVIC_SetPriority(TIM6_IRQn, 1, 0);      // PID定时器：次高优先级（优先级1）
+  HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);    // 串口：较低优先级（优先级2）
+  
+  // 初始化电机控制（使用TIM2作为编码器，TIM3作为PWM）
+  Motor_Control_Init(&motor1, &htim2, &htim3, TIM_CHANNEL_1, ENCODER_PPR_DEFAULT);
+  
+  // 启动PID计算定时器（10ms周期，100Hz）
+  HAL_TIM_Base_Start_IT(&htim6);
+  
   last_valid_ms = HAL_GetTick();
   start_uart_rx();
   /* USER CODE END 2 */
@@ -156,8 +197,29 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    // PID更新（在定时器中断中设置标志）
+    if (pid_update_flag)
+    {
+      pid_update_flag = 0;
+      Motor_Control_Update(&motor1, 0.01f);  // 10ms = 0.01s
+      
+      // 调试输出（每100次输出一次，约1秒）
+      #if DEBUG_ENABLE
+      debug_counter++;
+      if (debug_counter >= 100)
+      {
+        debug_counter = 0;
+        float target, current, pid_out;
+        Motor_Control_GetDebugInfo(&motor1, &target, &current, &pid_out);
+        // 这里可以添加串口输出调试信息
+        // 注意：需要实现printf重定向或使用HAL_UART_Transmit
+      }
+      #endif
+    }
+    
+    // 看门狗：500ms无遥控信号则停止电机
     if ((HAL_GetTick() - last_valid_ms) > 500) {
-      update_speed(128);
+      Motor_Control_Stop(&motor1);
       last_valid_ms = HAL_GetTick();
     }
   }
@@ -198,6 +260,43 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM2 Initialization Function (Encoder Mode)
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 0xFFFF;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 6;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 6;
+  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -260,6 +359,32 @@ static void MX_TIM3_Init(void)
   /* USER CODE END TIM3_Init 2 */
   HAL_TIM_MspPostInit(&htim3);
 
+}
+
+/**
+  * @brief TIM6 Initialization Function (PID Calculation Timer, 10ms period)
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 7200 - 1;  // 72MHz / 7200 = 10kHz
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 100 - 1;      // 10kHz / 100 = 100Hz (10ms)
+  htim6.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
